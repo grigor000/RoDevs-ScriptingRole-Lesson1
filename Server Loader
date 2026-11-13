@@ -1,0 +1,26 @@
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local function initModule(descendant)
+	if descendant:IsA("ModuleScript") then
+		task.spawn(function()
+			local success, service = pcall(require, descendant)
+			if success and type(service) == "table" and type(service.Init) == "function" then
+				local initStartTime = os.clock()
+				local initSuccess, err = pcall(service.Init, service)
+
+				if not initSuccess then
+					warn("Failed to initialize:", descendant.Name, "-", err)
+					return
+				end
+
+				local duration = os.clock() - initStartTime
+			end
+		end)
+	end
+end
+
+for _, descendant in ipairs(ServerScriptService:GetDescendants()) do
+	initModule(descendant)
+end
+
+ServerScriptService.DescendantAdded:Connect(initModule)
