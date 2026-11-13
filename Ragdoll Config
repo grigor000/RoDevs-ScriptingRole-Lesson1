@@ -1,0 +1,221 @@
+local RagdollConfig = {}
+
+RagdollConfig.Settings = {
+	WalkSpeed = 40,
+	JumpPower = 35,
+
+	AimMaxPitch = math.rad(40),
+	HeadMaxYaw = math.rad(45),
+	TorsoFollow = 0.15,
+	TorsoMaxYaw = math.rad(15),
+	AimSmoothing = 18,
+	AimSendRate = 10,
+	AimBehindFade = math.rad(70),
+
+	TorsoMaxAngularVelocity = 20,
+	RespSmoothing = 12,
+
+	TeleportSnapDistance = 25,
+	MaxRootDistance = 4,
+	MaxPartDistance = 10,
+	ResyncCheckInterval = 0.1,
+	ResyncSettleTime = 0.15,
+
+	LaunchSpeed = 26,
+	LaunchUp = 4,
+	SpinSpeed = 4,
+	MinAirTime = 0.08,
+	LandSettleTime = 0.12,
+	FreefallDelay = 0.15,
+
+	TorsoRespGround = 120,
+	TorsoRespLanding = 45,
+	TorsoMaxTorque = 1e5,
+	HeadResp = 40,
+
+	TorsoDensity = 0.05,
+	LimbDensity = 0.03,
+
+	LeanForward = math.rad(15),
+	LeanSide = math.rad(10),
+	LeanSmoothing = 12,
+	LeanEpsilon = math.rad(0.15),
+}
+
+RagdollConfig.HighLights = {
+	Basic = {
+		DepthMode = Enum.HighlightDepthMode.Occluded,
+		FillColor = Color3.fromRGB(255, 255, 255),
+		FillTransparency = 1,
+		OutlineColor = Color3.fromRGB(255, 255, 255),
+		OutlineTransparency = 0,
+	},
+	Detected = {
+		DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+		FillColor = Color3.fromRGB(5, 255, 1),
+		FillTransparency = 0.7,
+		OutlineColor = Color3.fromRGB(255, 255, 255),
+		OutlineTransparency = 0,
+	},
+	Selected = {
+		DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+		FillColor = Color3.fromRGB(255, 0, 0),
+		FillTransparency = 0.8,
+		OutlineColor = Color3.fromRGB(255, 0, 0),
+		OutlineTransparency = 0,
+	},
+}
+
+RagdollConfig.Sounds = {
+	Climbing = {
+		Name = "Climbing",
+		Settings = {
+			SoundId = "",
+			Volume = 0.5,
+		}
+	},
+	Died = {
+		Name = "Died",
+		Settings = {
+			SoundId = "",
+			Volume = 0.5,
+		}
+	},
+	FreeFalling = {
+		Name = "FreeFalling",
+		Settings = {
+			SoundId = "",
+			Volume = 0.5,
+		}
+	},
+	Jumping = {
+		Name = "Jumping",
+		Settings = {
+			SoundId = "rbxassetid://110249620715681",
+			Volume = 0.3,
+		}
+	},
+	Landing = {
+		Name = "Landing",
+		Settings = {
+			SoundId = "",
+			Volume = 0.5,
+		}
+	},
+	Running = {
+		Name = "Running",
+		Settings = {
+			SoundId = "rbxassetid://88054363433772",
+			Volume = 0.2,
+		}
+	},
+	Splash = {
+		Name = "Splash",
+		Settings = {
+			SoundId = "",
+			Volume = 0.5,
+		}
+	},
+	Swimming = {
+		Name = "Swimming",
+		Settings = {
+			SoundId = "",
+			Volume = 0.5,
+		}
+	},
+}
+
+RagdollConfig.CollisionGroups = {
+	Torso = "RagdollTorso",
+	Limb = "RagdollLimb",
+	LimbGround = "RagdollLimbGround",
+	Player = "PlayerGroup",
+	HandCollider = "RagdollHandCollider",
+	Dead = "RagdollDead",
+}
+
+RagdollConfig.States = {
+	Grounded = "Grounded",
+	Airborne = "Airborne",
+	Landing = "Landing",
+	Dead = "Dead",
+}
+
+RagdollConfig.AirStates = {
+	[Enum.HumanoidStateType.Jumping] = true,
+	[Enum.HumanoidStateType.Freefall] = true,
+}
+
+RagdollConfig.GroundStates = {
+	[Enum.HumanoidStateType.Landed] = true,
+	[Enum.HumanoidStateType.Running] = true,
+	[Enum.HumanoidStateType.RunningNoPhysics] = true,
+	[Enum.HumanoidStateType.Swimming] = true,
+	[Enum.HumanoidStateType.Climbing] = true,
+}
+
+RagdollConfig.GroundLimbNames = {"Left Arm", "Right Arm", "Head"}
+
+RagdollConfig.BodyParts = {
+	["Head"] = {
+		Attachment0 = {Position = Vector3.new(0, 1, 0), Orientation = Vector3.new(0, 0, 0)},
+		Attachment1 = {Position = Vector3.new(0, -0.5, 0), Orientation = Vector3.new(0, 0, 0)},
+		BallSocket = {
+			LimitsEnabled = true,
+			UpperAngle = 50,
+			TwistLimitsEnabled = true,
+			TwistLowerAngle = -60,
+			TwistUpperAngle = 60,
+		},
+	},
+	["Left Arm"] = {
+		Attachment0 = {Position = Vector3.new(-1, 1, 0), Orientation = Vector3.new(0, 0, 0)},
+		Attachment1 = {Position = Vector3.new(0.55, 1, 0), Orientation = Vector3.new(0, 0, 0)},
+		BallSocket = {
+			LimitsEnabled = true,
+			UpperAngle = 110,
+			TwistLimitsEnabled = true,
+			TwistLowerAngle = -45,
+			TwistUpperAngle = 45,
+		},
+		CollideWithTorso = false,
+	},
+	["Right Arm"] = {
+		Attachment0 = {Position = Vector3.new(1, 1, 0), Orientation = Vector3.new(0, 0, 0)},
+		Attachment1 = {Position = Vector3.new(-0.55, 1, 0), Orientation = Vector3.new(0, 0, 0)},
+		BallSocket = {
+			LimitsEnabled = true,
+			UpperAngle = 110,
+			TwistLimitsEnabled = true,
+			TwistLowerAngle = -45,
+			TwistUpperAngle = 45,
+		},
+		CollideWithTorso = false,
+	},
+	["Left Leg"] = {
+		Attachment0 = {Position = Vector3.new(-0.5, -1, 0), Orientation = Vector3.new(0, 0, 0)},
+		Attachment1 = {Position = Vector3.new(0, 1, 0), Orientation = Vector3.new(0, 0, 0)},
+		BallSocket = {
+			LimitsEnabled = true,
+			UpperAngle = 80,
+			TwistLimitsEnabled = true,
+			TwistLowerAngle = -30,
+			TwistUpperAngle = 30,
+		},
+		IsLeg = true,
+	},
+	["Right Leg"] = {
+		Attachment0 = {Position = Vector3.new(0.5, -1, 0), Orientation = Vector3.new(0, 0, 0)},
+		Attachment1 = {Position = Vector3.new(0, 1, 0), Orientation = Vector3.new(0, 0, 0)},
+		BallSocket = {
+			LimitsEnabled = true,
+			UpperAngle = 80,
+			TwistLimitsEnabled = true,
+			TwistLowerAngle = -30,
+			TwistUpperAngle = 30,
+		},
+		IsLeg = true,
+	},
+}
+
+return RagdollConfig
