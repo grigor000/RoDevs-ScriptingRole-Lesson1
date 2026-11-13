@@ -1,0 +1,89 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Net = {}
+local isServer = RunService:IsServer()
+
+local folderName = "NetworkContainer"
+local remoteFolder = ReplicatedStorage:FindFirstChild(folderName)
+
+if not remoteFolder and isServer then
+	remoteFolder = Instance.new("Folder")
+	remoteFolder.Name = folderName
+	remoteFolder.Parent = ReplicatedStorage
+elseif not remoteFolder then
+	remoteFolder = ReplicatedStorage:WaitForChild(folderName)
+end
+
+local function getRemote(name: string, className: string): Instance
+	local remote = remoteFolder:FindFirstChild(name)
+	if not remote then
+		if isServer then
+			remote = Instance.new(className)
+			remote.Name = name
+			remote.Parent = remoteFolder
+		else
+			remote = remoteFolder:WaitForChild(name, 5) or nil
+		end
+	end
+	return remote
+end
+
+if not isServer then
+	function Net.GetRemote(name:string) : RemoteEvent
+		local remote = getRemote(name, "RemoteEvent") :: RemoteEvent
+		return remote
+	end
+	
+	function Net.FireServer(eventName: string, ...)
+		local remote = getRemote(eventName, "RemoteEvent") :: RemoteEvent
+		remote:FireServer(...)
+	end
+
+	function Net.InvokeServer(functionName: string, ...): any
+		local remote = getRemote(functionName, "RemoteFunction") :: RemoteFunction
+		return remote:InvokeServer(...)
+	end
+
+	function Net.Connect(eventName: string, callback: (...any) -> ()): RBXScriptConnection
+		local remote = getRemote(eventName, "RemoteEvent") :: RemoteEvent
+		return remote.OnClientEvent:Connect(callback)
+	end
+else
+	function Net.CreateEvent(eventName: string)
+		local remote = getRemote(eventName, "RemoteEvent") :: RemoteEvent
+		return remote
+	end
+	
+	function Net.RemoveEvent(eventName: string)
+		local remote = getRemote(eventName, "RemoteEvent") :: RemoteEvent
+		remote:Destroy()
+	end
+	
+	function Net.FireClient(player: Player, eventName: string, ...)
+		local remote = getRemote(eventName, "RemoteEvent") :: RemoteEvent
+		remote:FireClient(player, ...)
+	end
+
+	function Net.FireAllClients(eventName: string, ...)
+		local remote = getRemote(eventName, "RemoteEvent") :: RemoteEvent
+		remote:FireAllClients(...)
+	end
+
+	function Net.InvokeClient(player: Player, functionName: string, ...): any
+		local remote = getRemote(functionName, "RemoteFunction") :: RemoteFunction
+		return remote:InvokeClient(player, ...)
+	end
+
+	function Net.Connect(eventName: string, callback: (Player, ...any) -> ()): RBXScriptConnection
+		local remote = getRemote(eventName, "RemoteEvent") :: RemoteEvent
+		return remote.OnServerEvent:Connect(callback)
+	end
+
+	function Net.HandleInvoke(functionName: string, callback: (Player, ...any) -> ...any)
+		local remote = getRemote(functionName, "RemoteFunction") :: RemoteFunction
+		remote.OnServerInvoke = callback
+	end
+end
+
+return Net
