@@ -1,0 +1,23 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local function initModule(descendant)
+	if descendant:IsA("ModuleScript") then
+		task.spawn(function()
+			local success, service = pcall(require, descendant)
+			if success and type(service) == "table" and type(service.Init) == "function" then
+				local initSuccess, err = pcall(service.Init, service)
+
+				if not initSuccess then
+					warn("Failed to initialize:", descendant.Name, "-", err)
+					return
+				end
+			end
+		end)
+	end
+end
+
+for _, descendant in ipairs(ReplicatedStorage:GetDescendants()) do
+	initModule(descendant)
+end
+
+ReplicatedStorage.DescendantAdded:Connect(initModule)
