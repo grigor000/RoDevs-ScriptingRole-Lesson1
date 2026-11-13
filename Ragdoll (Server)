@@ -1,0 +1,318 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PhysicsService = game:GetService("PhysicsService")
+local CollectionService = game:GetService("CollectionService")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local Packages = ReplicatedStorage:WaitForChild("Packages")
+local ConfigFolder = Shared:WaitForChild("Modules"):WaitForChild("Config")
+
+local Networker = require(Packages.Networker)
+local RagdollConfig = require(ConfigFolder.Ragdoll)
+
+local Characters = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Ragdoll"):WaitForChild("Characters")
+
+local Config = RagdollConfig.Settings
+local Groups = RagdollConfig.CollisionGroups
+
+local Tag = "RagdollCharacter"
+local NpcTag = "RagdollNPC"
+local AttrTemplate = "RagdollTemplate"
+local AttrYaw = "AimYaw"
+local AttrPitch = "AimPitch"
+local EventAim = "RagdollAim"
+
+local WorldFolderName = "Characters"
+local CharacterFolderSuffix = "_Character"
+
+local AimMaxPitch = Config.AimMaxPitch or math.rad(40)
+local AimMinInterval = 0.05
+
+for _, Name in {Groups.Torso, Groups.Limb, Groups.LimbGround, Groups.Player, Groups.HandCollider, Groups.Dead} do
+	pcall(function()
+		PhysicsService:RegisterCollisionGroup(Name)
+	end)
+end
+
+local function SetCollidable(Group1: string, Group2: string, State: boolean)
+	pcall(function()
+		PhysicsService:CollisionGroupSetCollidable(Group1, Group2, State)
+	end)
+end
+
+SetCollidable(Groups.Torso, Groups.Limb, true)
+SetCollidable(Groups.Torso, Groups.LimbGround, true)
+SetCollidable(Groups.Torso, Groups.Torso, false)
+SetCollidable(Groups.Torso, "Default", false)
+SetCollidable(Groups.Torso, Groups.Player, false)
+SetCollidable(Groups.Limb, Groups.Limb, false)
+SetCollidable(Groups.Limb, Groups.Player, false)
+SetCollidable(Groups.LimbGround, Groups.LimbGround, false)
+SetCollidable(Groups.LimbGround, Groups.Limb, false)
+SetCollidable(Groups.LimbGround, Groups.Player, false)
+SetCollidable(Groups.LimbGround, "Default", false)
+SetCollidable(Groups.HandCollider, Groups.Torso, true)
+SetCollidable(Groups.HandCollider, Groups.HandCollider, true)
+SetCollidable(Groups.HandCollider, "Default", true)
+SetCollidable(Groups.HandCollider, Groups.Player, false)
+SetCollidable(Groups.HandCollider, Groups.Limb, false)
+SetCollidable(Groups.HandCollider, Groups.LimbGround, false)
+
+for _, Other in {"Default", Groups.Torso, Groups.Limb, Groups.LimbGround, Groups.Player, Groups.HandCollider, Groups.Dead} do
+	SetCollidable(Groups.Dead, Other, false)
+end
+
+local Ragdoll = {}
+Ragdoll.Registered = {} :: {[Model]: boolean}
+
+local LastAim: {[Player]: number} = {}
+local FolderOwners: {[Instance]: Model} = {}
+
+local function GetWorldFolder(): Folder
+	local Folder = workspace:FindFirstChild(WorldFolderName)
+	if Folder and Folder:IsA("Folder") then
+		return Folder
+	end
+	Folder = Instance.new("Folder")
+	Folder.Name = WorldFolderName
+	Folder.Parent = workspace
+	return Folder :: Folder
+end
+
+local function CountTemplateUsage(): {[string]: number}
+	local Usage: {[string]: number} = {}
+
+	for _, Template in Characters:GetChildren() do
+		Usage[Template.Name] = 0
+	end
+
+	for Character in Ragdoll.Registered do
+		if Character.Parent then
+			local Name = Character:GetAttribute(AttrTemplate)
+			if typeof(Name) == "string" and Usage[Name] ~= nil then
+				Usage[Name] += 1
+			end
+		end
+	end
+
+	return Usage
+end
+
+local function PickTemplateName(TemplateName: any): string?
+	if typeof(TemplateName) == "string" and Characters:FindFirstChild(TemplateName) then
+		return TemplateName
+	end
+
+	local Templates = Characters:GetChildren()
+	if #Templates == 0 then
+		return nil
+	end
+
+	local Usage = CountTemplateUsage()
+
+	local MinUsage = math.huge
+	for _, Template in Templates do
+		MinUsage = math.min(MinUsage, Usage[Template.Name])
+	end
+
+	local Candidates = {}
+	for _, Template in Templates do
+		if Usage[Template.Name] == MinUsage then
+			table.insert(Candidates, Template.Name)
+		end
+	end
+
+	return Candidates[math.random(1, #Candidates)]
+end
+
+function Ragdoll.PlaceInFolder(Character: Model): Folder
+	local Current = Character.Parent
+	if Current and FolderOwners[Current] == Character then
+		return Current :: Folder
+	end
+
+	local World = GetWorldFolder()
+	local BaseName = Character.Name .. CharacterFolderSuffix
+	local Name = BaseName
+	local Index = 1
+
+	while true do
+		local Existing = World:FindFirstChild(Name)
+		if not Existing then
+			break
+		end
+		local Owner = FolderOwners[Existing]
+		if not Owner or Owner.Parent ~= Existing then
+			FolderOwners[Existing] = nil
+			Existing:Destroy()
+			break
+		end
+		Index += 1
+		Name = BaseName .. Index
+	end
+
+	local Folder = Instance.new("Folder")
+	Folder.Name = Name
+	Folder.Parent = World
+	FolderOwners[Folder] = Character
+	Character.Parent = Folder
+
+	Character.Destroying:Once(function()
+		FolderOwners[Folder] = nil
+		task.defer(function()
+			if Folder.Parent then
+				Folder:Destroy()
+			end
+		end)
+	end)
+
+	return Folder
+end
+
+local function Prepare(Descendant: Instance, RootPart: BasePart)
+	if Descendant:IsA("BasePart") then
+		Descendant.CanCollide = false
+		Descendant.Massless = Descendant ~= RootPart
+		Descendant.CollisionGroup = Groups.Player
+	end
+end
+
+function Ragdoll.LockPart(Character: Model, PartName: string)
+	local CleanName = string.gsub(PartName, "%s+", "")
+	Character:SetAttribute("LockedLimb_" .. CleanName, true)
+end
+
+function Ragdoll.UnlockPart(Character: Model, PartName: string)
+	local CleanName = string.gsub(PartName, "%s+", "")
+	Character:SetAttribute("LockedLimb_" .. CleanName, nil)
+end
+
+function Ragdoll.SetTemplate(Character: Model, TemplateName: string): boolean
+	if not Characters:FindFirstChild(TemplateName) then
+		return false
+	end
+	Character:SetAttribute(AttrTemplate, TemplateName)
+	local Owner = Players:GetPlayerFromCharacter(Character)
+	if Owner then
+		Owner:SetAttribute(AttrTemplate, TemplateName)
+	end
+	return true
+end
+
+function Ragdoll.Register(Character: Model, TemplateName: string?): boolean
+	if Ragdoll.Registered[Character] then
+		return false
+	end
+
+	local Humanoid = Character:WaitForChild("Humanoid", 5) :: Humanoid?
+	local RootPart = Character:WaitForChild("HumanoidRootPart", 5) :: BasePart?
+	if not Humanoid or not RootPart or not Character:IsDescendantOf(workspace) then
+		return false
+	end
+
+	local IsPlayer = Players:GetPlayerFromCharacter(Character) ~= nil
+
+	if IsPlayer then
+		Humanoid.UseJumpPower = true
+		Humanoid.WalkSpeed = Config.WalkSpeed
+		Humanoid.JumpPower = Config.JumpPower
+		Humanoid.RequiresNeck = false
+	end
+
+	Humanoid.BreakJointsOnDeath = false
+	local ChosenName = PickTemplateName(TemplateName)
+	if not ChosenName then
+		warn("[Ragdoll] Characters folder is empty")
+		return false
+	end
+
+	Ragdoll.Registered[Character] = true
+
+	Ragdoll.PlaceInFolder(Character)
+	Ragdoll.SetTemplate(Character, ChosenName)
+
+	if IsPlayer then
+		for _, Descendant in Character:GetDescendants() do
+			Prepare(Descendant, RootPart)
+		end
+		Character.DescendantAdded:Connect(function(Descendant)
+			Prepare(Descendant, RootPart)
+		end)
+	end
+
+	Character.Destroying:Once(function()
+		Ragdoll.Registered[Character] = nil
+	end)
+
+	CollectionService:AddTag(Character, Tag)
+	return true
+end
+
+function Ragdoll.Unregister(Character: Model): boolean
+	if not Ragdoll.Registered[Character] then
+		return false
+	end
+	Ragdoll.Registered[Character] = nil
+	CollectionService:RemoveTag(Character, Tag)
+	Character:SetAttribute(AttrTemplate, nil)
+	Character:SetAttribute(AttrYaw, nil)
+	Character:SetAttribute(AttrPitch, nil)
+	return true
+end
+
+function Ragdoll.Init()
+	GetWorldFolder()
+
+	Networker.Connect(EventAim, function(Player: Player, Yaw: any, Pitch: any)
+		if typeof(Yaw) ~= "number" or typeof(Pitch) ~= "number" then return end
+		if Yaw ~= Yaw or Pitch ~= Pitch then return end
+
+		local Now = os.clock()
+		if Now - (LastAim[Player] or 0) < AimMinInterval then return end
+		LastAim[Player] = Now
+
+		local Character = Player.Character
+		if not Character or not Ragdoll.Registered[Character] then return end
+
+		Yaw = math.clamp(Yaw, -math.pi, math.pi)
+		Pitch = math.clamp(Pitch, -AimMaxPitch, AimMaxPitch)
+		Character:SetAttribute(AttrYaw, math.round(Yaw * 100) / 100)
+		Character:SetAttribute(AttrPitch, math.round(Pitch * 100) / 100)
+	end)
+
+	local function OnPlayer(Player: Player)
+		Player.CharacterAdded:Connect(function(Character)
+			Ragdoll.Register(Character)
+		end)
+		if Player.Character then
+			task.spawn(Ragdoll.Register, Player.Character)
+		end
+	end
+
+	Players.PlayerAdded:Connect(OnPlayer)
+	for _, Player in Players:GetPlayers() do
+		task.spawn(OnPlayer, Player)
+	end
+
+	Players.PlayerRemoving:Connect(function(Player)
+		LastAim[Player] = nil
+	end)
+
+	CollectionService:GetInstanceAddedSignal(NpcTag):Connect(function(Instance_)
+		if Instance_:IsA("Model") then
+			task.spawn(Ragdoll.Register, Instance_)
+		end
+	end)
+	CollectionService:GetInstanceRemovedSignal(NpcTag):Connect(function(Instance_)
+		if Instance_:IsA("Model") then
+			Ragdoll.Unregister(Instance_)
+		end
+	end)
+	for _, Instance_ in CollectionService:GetTagged(NpcTag) do
+		if Instance_:IsA("Model") then
+			task.spawn(Ragdoll.Register, Instance_)
+		end
+	end
+end
+
+return Ragdoll
