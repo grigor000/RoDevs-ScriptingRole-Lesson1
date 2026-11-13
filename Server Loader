@@ -5,15 +5,12 @@ local function initModule(descendant)
 		task.spawn(function()
 			local success, service = pcall(require, descendant)
 			if success and type(service) == "table" and type(service.Init) == "function" then
-				local initStartTime = os.clock()
 				local initSuccess, err = pcall(service.Init, service)
 
 				if not initSuccess then
 					warn("Failed to initialize:", descendant.Name, "-", err)
 					return
 				end
-
-				local duration = os.clock() - initStartTime
 			end
 		end)
 	end
