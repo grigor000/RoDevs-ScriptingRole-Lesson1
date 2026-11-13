@@ -1,0 +1,1181 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+
+local Packages = ReplicatedStorage:WaitForChild("Packages")
+local Networker = require(Packages:WaitForChild("Networker") :: ModuleScript)
+
+local ConfigFolder = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Modules"):WaitForChild("Config")
+
+local RagdollConfig = require(ConfigFolder.Ragdoll)
+local Characters = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Ragdoll"):WaitForChild("Characters")
+
+local Config = RagdollConfig.Settings
+local Groups = RagdollConfig.CollisionGroups
+local States = RagdollConfig.States
+local Sounds = RagdollConfig.Sounds
+local HighLights = RagdollConfig.HighLights
+
+local Tag = "RagdollCharacter"
+local AttrTemplate = "RagdollTemplate"
+local AttrYaw = "AimYaw"
+local AttrPitch = "AimPitch"
+local AttrBomb = "BombHighlight"
+local EventAim = "RagdollAim"
+
+local AimMaxPitch = Config.AimMaxPitch or math.rad(40)
+local HeadMaxYaw = Config.HeadMaxYaw or math.rad(45)
+local TorsoFollow = Config.TorsoFollow or 0.15
+local TorsoMaxYaw = Config.TorsoMaxYaw or math.rad(15)
+local AimSmoothing = Config.AimSmoothing or 18
+local AimSendRate = Config.AimSendRate or 10
+local AimBehindFade = Config.AimBehindFade or math.rad(70)
+
+local TeleportSnapDistance = Config.TeleportSnapDistance or 25
+local MaxRootDistance = Config.MaxRootDistance or 4
+local MaxPartDistance = Config.MaxPartDistance or 10
+local CheckInterval = Config.ResyncCheckInterval or 0.1
+local ResyncSettle = Config.ResyncSettleTime or 0.15
+
+local RespSmoothing = Config.RespSmoothing or 12
+local TorsoMaxAngularVelocity = Config.TorsoMaxAngularVelocity or 20
+
+local FollowGain = Config.FollowGain or 30
+local FollowMaxError = Config.FollowMaxError or 8
+local VelocitySmoothing = Config.VelocitySmoothing or 40
+
+local FallbackFolderName = "RagdollPuppets"
+
+local function GetFallbackFolder(): Folder
+	local Folder = workspace:FindFirstChild(FallbackFolderName)
+	if not Folder then
+		Folder = Instance.new("Folder")
+		Folder.Name = FallbackFolderName
+		Folder.Parent = workspace
+	end
+	return Folder :: Folder
+end
+
+local function GetTemplateParent(Character: Model): Instance
+	local Parent = Character.Parent
+	if Parent and Parent:IsA("Folder") then
+		return Parent
+	end
+	return GetFallbackFolder()
+end
+
+local LocalPlayer = Players.LocalPlayer
+
+local function LocalHasBomb(): boolean
+	local LocalCharacter = LocalPlayer.Character
+	return LocalCharacter ~= nil and LocalCharacter:GetAttribute(AttrBomb) == "Selected"
+end
+
+local Puppet = {}
+Puppet.__index = Puppet
+
+local Puppets: {[Model]: any} = {}
+local Pending: {[Model]: boolean} = {}
+
+local function RefreshAllHighlights()
+	for _, Existing in Puppets do
+		Existing:UpdateHighlight()
+	end
+end
+
+function Puppet.new(Character: Model, TemplateName: string)
+	local Humanoid = Character:WaitForChild("Humanoid", 5) :: Humanoid?
+	local RootPart = Character:WaitForChild("HumanoidRootPart", 5) :: BasePart?
+	local Source = Characters:FindFirstChild(TemplateName)
+	if not (Humanoid and RootPart and Source and Character:IsDescendantOf(workspace)) then
+		warn(("[Ragdoll] cannot build puppet: humanoid=%s root=%s template(%s)=%s inWorkspace=%s"):format(
+			tostring(Humanoid ~= nil),
+			tostring(RootPart ~= nil),
+			tostring(TemplateName),
+			tostring(Source ~= nil),
+			tostring(Character:IsDescendantOf(workspace))
+			))
+		return nil
+	end
+
+	local self = setmetatable({}, Puppet)
+	self.Character = Character
+	self.Humanoid = Humanoid
+	self.RootPart = RootPart
+	self.TemplateName = TemplateName
+	self.Player = Players:GetPlayerFromCharacter(Character)
+	self.IsLocal = self.Player ~= nil and self.Player == LocalPlayer
+	self.Driven = not self.IsLocal
+
+	self.connections = {}
+	self.Legs = {}
+	self.HandColliders = {}
+	self.PartOffsets = {}
+	self.Hidden = {}
+	self.RootOffset = CFrame.identity
+	self.RootWeld = nil
+	self.RestRot = CFrame.identity
+	self.TorsoRest = Vector3.zero
+
+	self.State = States.Grounded
+	self.Token = 0
+	self.FallToken = 0
+	self.AirStart = 0
+	self.Destroyed = false
+
+	self.Resyncing = false
+	self.BadChecks = 0
+	self.CheckTimer = 0
+	self.LastRootPos = RootPart.Position
+	self.LastDrivePos = RootPart.Position
+	self.RootVel = Vector3.zero
+	self.LastState = Humanoid:GetState()
+
+	self.AimDelta = 0
+	self.AimPitch = 0
+	self.SentDelta = 0
+	self.SentPitch = 0
+	self.LastAimSend = 0
+	self.TorsoYaw = 0
+	self.HeadYaw = 0
+	self.HeadPitch = 0
+	self.LeanPitch = 0
+	self.LeanRoll = 0
+	self.TorsoResp = Config.TorsoRespGround
+	self.TorsoRespTarget = Config.TorsoRespGround
+
+	local Filter = {Character}
+	local World = workspace:FindFirstChild("Characters")
+	if World then
+		table.insert(Filter, World)
+	end
+	self.GroundParams = RaycastParams.new()
+	self.GroundParams.FilterType = Enum.RaycastFilterType.Exclude
+	self.GroundParams.FilterDescendantsInstances = Filter
+
+	local Ok, Built = pcall(self.Build, self, Source)
+	if not Ok then
+		warn("[Ragdoll] build error for " .. Character.Name .. ": " .. tostring(Built))
+		self:Destroy()
+		return nil
+	end
+	if not Built then
+		warn("[Ragdoll] template '" .. TemplateName .. "' needs parts named HumanoidRootPart and Torso")
+		self:Destroy()
+		return nil
+	end
+
+	return self
+end
+
+function Puppet:SetHighLight(Type)
+	if not self.Highlight then return end
+
+	local HighlightType = HighLights[Type] or HighLights.Basic
+	for Key, Value in pairs(HighlightType) do
+		self.Highlight[Key] = Value
+	end
+end
+
+function Puppet:UpdateHighlight()
+	local Held = self.Character:GetAttribute(AttrBomb)
+	if Held then
+		self:SetHighLight(Held)
+		return
+	end
+
+	if LocalHasBomb() and self.Character ~= LocalPlayer.Character then
+		self:SetHighLight("Detected")
+	else
+		self:SetHighLight("Basic")
+	end
+end
+
+function Puppet:Build(Source: Model): boolean
+	local Template = Source:Clone() :: Model
+	local TemplateRoot = Template:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local TemplateTorso = Template:FindFirstChild("Torso") :: BasePart?
+	if not TemplateRoot or not TemplateTorso then
+		Template:Destroy()
+		return false
+	end
+
+	self.Template = Template
+	self.TemplateRoot = TemplateRoot
+	self.TemplateTorso = TemplateTorso
+
+	self.Highlight = Instance.new("Highlight", Template)
+	self:SetHighLight()
+
+	for _, Descendant in Template:GetDescendants() do
+		if Descendant:IsA("Motor6D") or Descendant:IsA("Humanoid") or Descendant:IsA("BaseScript") or Descendant:IsA("NoCollisionConstraint") then
+			Descendant:Destroy()
+		elseif Descendant:IsA("BasePart") then
+			local IsTorso = Descendant.Name == "Torso"
+			Descendant.Anchored = false
+			Descendant.Massless = false
+			Descendant.CollisionGroup = IsTorso and Groups.Torso or Groups.Limb
+			Descendant.CustomPhysicalProperties = PhysicalProperties.new(IsTorso and Config.TorsoDensity or Config.LimbDensity, 0.5, 0, 1, 1)
+		end
+	end
+
+	TemplateRoot.CanCollide = false
+	TemplateRoot.Massless = true
+	TemplateTorso.CanCollide = true
+	if self.Driven then
+		TemplateRoot.Anchored = true
+	end
+
+	task.delay(1, function()
+		local CharacterRootPart = self.RootPart
+		if CharacterRootPart then
+			for SoundName, SoundData in pairs(Sounds) do
+				local SoundObj = CharacterRootPart:FindFirstChild(SoundName)
+				if SoundObj and SoundData.Settings then
+					for SettingName, SettingValue in pairs(SoundData.Settings) do
+						if SoundObj[SettingName] ~= nil then
+							SoundObj[SettingName] = SettingValue
+						end
+					end
+				end
+			end
+		end
+	end)
+
+	Template.Name = self.Character.Name .. "Template"
+	Template.Parent = GetTemplateParent(self.Character)
+	Template:PivotTo(self.RootPart.CFrame)
+
+	self.RootOffset = self.RootPart.CFrame:ToObjectSpace(TemplateRoot.CFrame)
+	self.TorsoRest = TemplateRoot.CFrame:PointToObjectSpace(TemplateTorso.Position)
+	for _, Child in Template:GetChildren() do
+		if Child:IsA("BasePart") and Child ~= TemplateRoot and (Child == TemplateTorso or RagdollConfig.BodyParts[Child.Name]) then
+			self.PartOffsets[Child] = TemplateRoot.CFrame:ToObjectSpace(Child.CFrame)
+		end
+	end
+	self.RestRot = TemplateRoot.CFrame:ToObjectSpace(TemplateTorso.CFrame).Rotation
+
+	if not self.Driven then
+		self:CreateRootWeld()
+	end
+	self:ConnectTorso()
+
+	for _, Child in Template:GetChildren() do
+		if Child:IsA("BasePart") and RagdollConfig.BodyParts[Child.Name] then
+			local Socket = self:RagdollPart(Child, TemplateTorso)
+			if RagdollConfig.BodyParts[Child.Name].IsLeg and Socket then
+				local Real = self.Character:FindFirstChild(Child.Name) or self.RootPart
+				table.insert(self.Legs, {
+					Part = Child,
+					Real = Real,
+					Offset = (Real :: BasePart).CFrame:ToObjectSpace(Child.CFrame),
+					Socket = Socket,
+					Weld = nil,
+					Locked = false,
+				})
+			end
+		end
+	end
+
+	self:SetupHandColliders()
+	self:SetLimbsGrounded(true)
+
+	self.TorsoAlign = self:CreateAlign(TemplateTorso, "TorsoAlign")
+	self:SetupTorsoFollow()
+
+	self.HeadAlign = nil
+	local Head = Template:FindFirstChild("Head")
+	if Head and Head:IsA("BasePart") then
+		self.HeadAlign = self:CreateAlign(Head, "HeadAlign")
+		self.HeadAlign.Responsiveness = Config.HeadResp
+	end
+
+	if self.TorsoAlign then
+		self.TorsoAlign.Responsiveness = self.TorsoResp
+	end
+	self:SetAlignEnabled(true)
+	self:LockLegs()
+
+	self.connections.StateChanged = self.Humanoid.StateChanged:Connect(function(_, New)
+		self.LastState = New
+		self:OnStateChanged(New)
+	end)
+	self.connections.Died = self.Humanoid.Died:Once(function()
+		self:EnterDead()
+	end)
+	self.connections.Destroying = self.Character.Destroying:Once(function()
+		self:Destroy()
+	end)
+
+	if RagdollConfig.AirStates[self.Humanoid:GetState()] then
+		self:EnterAir()
+	end
+
+	return true
+end
+
+function Puppet:PrepareReal()
+	if self.Player then
+		return
+	end
+	local function Set(Descendant: Instance)
+		if Descendant:IsA("BasePart") then
+			Descendant.CollisionGroup = Groups.Player
+		end
+	end
+	for _, Descendant in self.Character:GetDescendants() do
+		Set(Descendant)
+	end
+	self.connections.Prepare = self.Character.DescendantAdded:Connect(Set)
+end
+
+function Puppet:HideReal()
+	local function Hide(Descendant: Instance)
+		if Descendant:IsA("BasePart") or Descendant:IsA("Decal") or Descendant:IsA("Texture") then
+			if self.Hidden[Descendant] == nil then
+				self.Hidden[Descendant] = Descendant.Transparency
+			end
+			Descendant.Transparency = 1
+		end
+	end
+	for _, Descendant in self.Character:GetDescendants() do
+		Hide(Descendant)
+	end
+	self.connections.Hide = self.Character.DescendantAdded:Connect(Hide)
+end
+
+function Puppet:RestoreReal()
+	for Descendant, Transparency in self.Hidden do
+		if Descendant.Parent then
+			(Descendant :: any).Transparency = Transparency
+		end
+	end
+	table.clear(self.Hidden)
+end
+
+function Puppet:CreateRootWeld()
+	if self.RootWeld then
+		self.RootWeld:Destroy()
+	end
+	local Weld = Instance.new("WeldConstraint")
+	Weld.Name = "RagdollWeld"
+	Weld.Part0 = self.RootPart
+	Weld.Part1 = self.TemplateRoot
+	Weld.Parent = self.TemplateRoot
+	self.RootWeld = Weld
+end
+
+function Puppet:SetupHandColliders()
+	for _, ArmName in {"Left Arm", "Right Arm"} do
+		local ArmPart = self.Template:FindFirstChild(ArmName)
+		if ArmPart and ArmPart:IsA("BasePart") then
+			local Collider = Instance.new("Part")
+			Collider.Name = ArmName .. "_Collider"
+			Collider.Size = ArmPart.Size
+			Collider.Transparency = 1
+			Collider.CanCollide = true
+			Collider.Anchored = false
+			Collider.Massless = true
+			Collider.CollisionGroup = Groups.HandCollider
+			Collider.CFrame = ArmPart.CFrame
+			Collider.Parent = self.Template
+
+			local ColliderWeld = Instance.new("WeldConstraint")
+			ColliderWeld.Part0 = ArmPart
+			ColliderWeld.Part1 = Collider
+			ColliderWeld.Parent = Collider
+
+			table.insert(self.HandColliders, Collider)
+		end
+	end
+end
+
+function Puppet:ConnectTorso()
+	local Attachment0 = Instance.new("Attachment")
+	Attachment0.Name = "TorsoRootAttachment"
+	Attachment0.CFrame = CFrame.new(self.TorsoRest)
+	Attachment0.Parent = self.TemplateRoot
+
+	local Attachment1 = Instance.new("Attachment")
+	Attachment1.Name = "TorsoRootAttachment"
+	Attachment1.Parent = self.TemplateTorso
+
+	local Socket = Instance.new("BallSocketConstraint")
+	Socket.Name = "TorsoBallSocket"
+	Socket.LimitsEnabled = false
+	Socket.TwistLimitsEnabled = false
+	Socket.Attachment0 = Attachment0
+	Socket.Attachment1 = Attachment1
+	Socket.Parent = self.TemplateTorso
+
+	local NoCollision = Instance.new("NoCollisionConstraint")
+	NoCollision.Part0 = self.TemplateRoot
+	NoCollision.Part1 = self.TemplateTorso
+	NoCollision.Parent = self.TemplateTorso
+end
+
+function Puppet:SetupTorsoFollow()
+	local Follow = Instance.new("Attachment")
+	Follow.Name = "TorsoFollowAttachment"
+	Follow.CFrame = self.RestRot
+	Follow.Parent = self.TemplateRoot
+	self.TorsoFollow = Follow
+
+	local Align = self.TorsoAlign
+	if Align then
+		Align.Mode = Enum.OrientationAlignmentMode.TwoAttachment
+		Align.Attachment1 = Follow
+		Align.MaxTorque = Config.TorsoMaxTorque
+		Align.MaxAngularVelocity = TorsoMaxAngularVelocity
+	end
+end
+
+function Puppet:CreateAlign(Part: BasePart, Name: string): AlignOrientation
+	local Attachment = Instance.new("Attachment")
+	Attachment.Name = Name .. "Attachment"
+	Attachment.Parent = Part
+
+	local Align = Instance.new("AlignOrientation")
+	Align.Name = Name
+	Align.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	Align.Attachment0 = Attachment
+	Align.RigidityEnabled = false
+	Align.MaxTorque = 100000
+	Align.Responsiveness = Config.HeadResp
+	Align.CFrame = self.RootPart.CFrame.Rotation
+	Align.Enabled = false
+	Align.Parent = self.Template
+
+	return Align
+end
+
+function Puppet:RagdollPart(Part: BasePart, Torso: BasePart): BallSocketConstraint?
+	local PartConfig = RagdollConfig.BodyParts[Part.Name]
+	if not PartConfig then
+		return nil
+	end
+
+	Part.CanCollide = true
+
+	local Attachment0 = Instance.new("Attachment")
+	Attachment0.Name = Part.Name .. "_Attachment0"
+	Attachment0.Position = PartConfig.Attachment0.Position
+	Attachment0.Orientation = PartConfig.Attachment0.Orientation
+	Attachment0.Parent = Torso
+
+	local Attachment1 = Instance.new("Attachment")
+	Attachment1.Name = Part.Name .. "_Attachment1"
+	Attachment1.Position = PartConfig.Attachment1.Position
+	Attachment1.Orientation = PartConfig.Attachment1.Orientation
+	Attachment1.Parent = Part
+
+	local Socket = Instance.new("BallSocketConstraint")
+	Socket.Name = Part.Name .. "_BallSocketConstraint"
+	Socket.Attachment0 = Attachment0
+	Socket.Attachment1 = Attachment1
+	for Property, Value in PartConfig.BallSocket do
+		(Socket :: any)[Property] = Value
+	end
+	Socket.Parent = Part
+
+	if PartConfig.CollideWithTorso == false then
+		local NoCollision = Instance.new("NoCollisionConstraint")
+		NoCollision.Name = Part.Name .. "_NoCollision"
+		NoCollision.Part0 = Part
+		NoCollision.Part1 = Torso
+		NoCollision.Parent = Part
+	end
+
+	return Socket
+end
+
+function Puppet:SetAlignEnabled(State: boolean)
+	if self.TorsoAlign then
+		self.TorsoAlign.Enabled = State
+	end
+	if self.HeadAlign then
+		self.HeadAlign.Enabled = State
+	end
+end
+
+function Puppet:SetTorsoResponsiveness(Value: number)
+	self.TorsoRespTarget = Value
+end
+
+function Puppet:UpdateResponsiveness(Dt: number)
+	local Align = self.TorsoAlign
+	if not Align or self.State == States.Dead then
+		return
+	end
+	local Alpha = 1 - math.exp(-RespSmoothing * Dt)
+	self.TorsoResp += (self.TorsoRespTarget - self.TorsoResp) * Alpha
+	Align.Responsiveness = self.TorsoResp
+end
+
+function Puppet:IsNearGround(): boolean
+	local Root = self.RootPart
+	local Reach = math.max(self.Humanoid.HipHeight + Root.Size.Y * 0.5, 3) + 1.5
+	return workspace:Raycast(Root.Position, Vector3.new(0, -Reach, 0), self.GroundParams) ~= nil
+end
+
+function Puppet:SetLimbsGrounded(Grounded: boolean)
+	for _, Name in RagdollConfig.GroundLimbNames do
+		local Part = self.Template:FindFirstChild(Name)
+		if Part and Part:IsA("BasePart") then
+			Part.CollisionGroup = Grounded and Groups.LimbGround or Groups.Limb
+		end
+	end
+end
+
+function Puppet:LockLegs()
+	for _, Leg in self.Legs do
+		if Leg.Locked then
+			continue
+		end
+		Leg.Locked = true
+		Leg.Socket.Enabled = false
+		Leg.Part.CanCollide = false
+		Leg.Part.Massless = true
+		Leg.Part.AssemblyLinearVelocity = Vector3.zero
+		Leg.Part.AssemblyAngularVelocity = Vector3.zero
+		Leg.Part.CFrame = (Leg.Real :: BasePart).CFrame * Leg.Offset
+
+		if self.Driven then
+			Leg.Part.Anchored = true
+		else
+			local Weld = Instance.new("WeldConstraint")
+			Weld.Name = "LegWeld"
+			Weld.Part0 = Leg.Real :: BasePart
+			Weld.Part1 = Leg.Part
+			Weld.Parent = Leg.Part
+			Leg.Weld = Weld
+		end
+	end
+end
+
+function Puppet:UnlockLegs()
+	for _, Leg in self.Legs do
+		if Leg.Weld then
+			Leg.Weld:Destroy()
+			Leg.Weld = nil
+		end
+		if Leg.Locked then
+			Leg.Locked = false
+			Leg.Part.Anchored = false
+			Leg.Socket.Enabled = true
+			Leg.Part.CanCollide = true
+			Leg.Part.Massless = false
+			if self.Driven then
+				Leg.Part.AssemblyLinearVelocity = self.RootVel
+			end
+		end
+	end
+end
+
+function Puppet:UpdateCustomLockedLimbs()
+	if not self.Template then return end
+
+	for _, Child in self.Template:GetChildren() do
+		if Child:IsA("BasePart") then
+			local CleanName = string.gsub(Child.Name, "%s+", "")
+			local IsLocked = self.Character:GetAttribute("LockedLimb_" .. CleanName) == true
+			local Socket = Child:FindFirstChildOfClass("BallSocketConstraint")
+			local CustomWeld = Child:FindFirstChild("CustomLockWeld")
+
+			if IsLocked then
+				if Socket then Socket.Enabled = false end
+				Child.CanCollide = false
+				Child.Massless = true
+
+				local RealPart = self.Character:FindFirstChild(Child.Name)
+				if RealPart and RealPart:IsA("BasePart") and not CustomWeld then
+					Child.CFrame = RealPart.CFrame
+					local Weld = Instance.new("WeldConstraint")
+					Weld.Name = "CustomLockWeld"
+					Weld.Part0 = RealPart
+					Weld.Part1 = Child
+					Weld.Parent = Child
+				end
+			else
+				if CustomWeld then
+					CustomWeld:Destroy()
+				end
+				if Socket and self.State == States.Airborne then
+					Socket.Enabled = true
+					Child.CanCollide = true
+					Child.Massless = false
+				end
+			end
+		end
+	end
+end
+
+function Puppet:OnStateChanged(New: Enum.HumanoidStateType)
+	if self.State == States.Dead or self.Destroyed then
+		return
+	end
+	self.FallToken += 1
+	local FallToken = self.FallToken
+
+	if New == Enum.HumanoidStateType.Jumping then
+		self:EnterAir()
+	elseif New == Enum.HumanoidStateType.Freefall then
+		if self.State == States.Airborne then
+			return
+		end
+		task.delay(Config.FreefallDelay, function()
+			if self.Destroyed or self.State == States.Dead or self.FallToken ~= FallToken then
+				return
+			end
+			if self.Humanoid:GetState() == Enum.HumanoidStateType.Freefall and not self:IsNearGround() then
+				self:EnterAir()
+			end
+		end)
+	elseif RagdollConfig.GroundStates[New] then
+		self:RequestLand()
+	end
+end
+
+function Puppet:PollState()
+	local CurrentState = self.Humanoid:GetState()
+	if CurrentState ~= self.LastState then
+		self.LastState = CurrentState
+		self:OnStateChanged(CurrentState)
+	end
+end
+
+function Puppet:EnterAir()
+	if self.State == States.Airborne then
+		return
+	end
+	self.Token += 1
+	self.State = States.Airborne
+	self.AirStart = os.clock()
+
+	self:SetAlignEnabled(false)
+	self:SetLimbsGrounded(false)
+	self:UnlockLegs()
+	self:Launch()
+end
+
+function Puppet:Launch()
+	local Torso = self.TemplateTorso
+	if not Torso.Parent then
+		return
+	end
+
+	local Flat = Vector3.zero
+	if self.IsLocal then
+		local Move = self.Humanoid.MoveDirection
+		Flat = Vector3.new(Move.X, 0, Move.Z)
+	end
+	if Flat.Magnitude <= 0.1 then
+		local Velocity = self.Driven and self.RootVel or self.RootPart.AssemblyLinearVelocity
+		Flat = Vector3.new(Velocity.X, 0, Velocity.Z)
+	end
+
+	local Direction, Axis
+	if Flat.Magnitude > 0.1 then
+		Direction = Flat.Unit
+		Axis = Vector3.yAxis:Cross(Direction)
+	else
+		local Angle = math.random() * math.pi * 2
+		Direction = Vector3.zero
+		Axis = Vector3.new(math.cos(Angle), 0, math.sin(Angle)) * 0.6
+	end
+
+	local Spin = Config.SpinSpeed * (0.8 + math.random() * 0.4)
+	Torso.AssemblyLinearVelocity += Direction * Config.LaunchSpeed + Vector3.new(0, Config.LaunchUp, 0)
+	Torso.AssemblyAngularVelocity = Axis * Spin
+end
+
+function Puppet:RequestLand()
+	if self.State ~= States.Airborne then
+		return
+	end
+
+	local Remaining = Config.MinAirTime - (os.clock() - self.AirStart)
+	if Remaining <= 0 then
+		self:EnterLanding()
+		return
+	end
+
+	local Token = self.Token
+	task.delay(Remaining, function()
+		if self.Destroyed or self.Token ~= Token or self.State ~= States.Airborne then
+			return
+		end
+		if RagdollConfig.AirStates[self.Humanoid:GetState()] then
+			return
+		end
+		self:EnterLanding()
+	end)
+end
+
+function Puppet:EnterLanding()
+	self.Token += 1
+	local Token = self.Token
+	self.State = States.Landing
+
+	self.TemplateTorso.AssemblyLinearVelocity = Vector3.zero
+	self.TemplateTorso.AssemblyAngularVelocity = Vector3.zero
+	local Head = self.Template:FindFirstChild("Head")
+	if Head and Head:IsA("BasePart") then
+		Head.AssemblyLinearVelocity = Vector3.zero
+		Head.AssemblyAngularVelocity = Vector3.zero
+	end
+	self:SetTorsoResponsiveness(Config.TorsoRespLanding)
+	self:SetAlignEnabled(true)
+
+	task.delay(Config.LandSettleTime, function()
+		if self.Destroyed or self.Token ~= Token then
+			return
+		end
+		self:LockLegs()
+		self:SetLimbsGrounded(true)
+		self:SetTorsoResponsiveness(Config.TorsoRespGround)
+		self.State = States.Grounded
+	end)
+end
+
+function Puppet:ReleaseFromBody()
+	local Velocity = self.Driven and self.RootVel or self.RootPart.AssemblyLinearVelocity
+
+	if self.RootWeld then
+		self.RootWeld:Destroy()
+		self.RootWeld = nil
+	end
+	self.TemplateRoot.Anchored = false
+
+	self:SetAlignEnabled(false)
+	self:SetLimbsGrounded(false)
+	self:UnlockLegs()
+
+	for _, Descendant in self.Template:GetDescendants() do
+		if Descendant:IsA("BasePart") and not Descendant.Anchored then
+			Descendant.AssemblyLinearVelocity = Velocity
+		end
+	end
+end
+
+function Puppet:EnterDead()
+	if self.Destroyed or self.State == States.Dead then
+		return
+	end
+	self.Token += 1
+	self.FallToken += 1
+	self.State = States.Dead
+
+	self:ReleaseFromBody()
+
+	task.delay(3, function()
+		if not self.Destroyed then
+			self:Destroy()
+		end
+	end)
+end
+
+function Puppet:Resync()
+	if self.Destroyed or self.Resyncing or self.State == States.Dead then
+		return
+	end
+	local Root = self.TemplateRoot
+	if not Root.Parent then
+		return
+	end
+
+	self.Resyncing = true
+	self.BadChecks = 0
+	self.CheckTimer = 0
+	self.LastRootPos = self.RootPart.Position
+	self.LastDrivePos = self.RootPart.Position
+	self.RootVel = Vector3.zero
+
+	local LockedLegs: {[BasePart]: boolean} = {}
+	for _, Leg in self.Legs do
+		if Leg.Locked then
+			LockedLegs[Leg.Part] = true
+		end
+	end
+
+	if self.RootWeld then
+		self.RootWeld:Destroy()
+		self.RootWeld = nil
+	end
+	Root.AssemblyLinearVelocity = Vector3.zero
+	Root.AssemblyAngularVelocity = Vector3.zero
+	Root.CFrame = self.RootPart.CFrame * self.RootOffset
+
+	local RootCF = Root.CFrame
+	for Part, Offset in self.PartOffsets do
+		if Part.Parent and not LockedLegs[Part] then
+			Part.AssemblyLinearVelocity = Vector3.zero
+			Part.AssemblyAngularVelocity = Vector3.zero
+			Part.CFrame = RootCF * Offset
+		end
+	end
+
+	if not self.Driven then
+		self:CreateRootWeld()
+	end
+
+	task.delay(ResyncSettle, function()
+		if self.Destroyed then
+			return
+		end
+		self.Resyncing = false
+		self.LastRootPos = self.RootPart.Position
+		self.LastDrivePos = self.RootPart.Position
+	end)
+end
+
+function Puppet:Watchdog(Dt: number)
+	if self.Destroyed or self.Resyncing or self.State == States.Dead then
+		return
+	end
+
+	local Root = self.TemplateRoot
+	if not Root.Parent then
+		return
+	end
+
+	local RootPos = self.RootPart.Position
+	local Moved = (RootPos - self.LastRootPos).Magnitude
+	self.LastRootPos = RootPos
+	local Explained = self.RootPart.AssemblyLinearVelocity.Magnitude * Dt
+	if Moved - Explained > TeleportSnapDistance then
+		self:Resync()
+		return
+	end
+
+	self.CheckTimer += Dt
+	if self.CheckTimer < CheckInterval then
+		return
+	end
+	self.CheckTimer = 0
+
+	local Broken = false
+	if not self.Driven and (not self.RootWeld or not self.RootWeld.Parent or (Root.Position - RootPos).Magnitude > MaxRootDistance) then
+		Broken = true
+	else
+		local RootP = Root.Position
+		for Part in self.PartOffsets do
+			if Part.Parent and (Part.Position - RootP).Magnitude > MaxPartDistance then
+				Broken = true
+				break
+			end
+		end
+	end
+
+	if Broken then
+		self.BadChecks += 1
+		if self.BadChecks >= 2 then
+			self:Resync()
+		end
+	else
+		self.BadChecks = 0
+	end
+end
+
+function Puppet:GetCharacter()
+	return self.Character
+end
+
+function Puppet:Drive(Dt: number)
+	local Root = self.TemplateRoot
+	if not Root.Parent then
+		return
+	end
+
+	local RealRoot = self.RootPart
+	local Position = RealRoot.Position
+	local Delta = Position - self.LastDrivePos
+	self.LastDrivePos = Position
+
+	local Velocity = Delta / Dt
+	if Delta.Magnitude > TeleportSnapDistance then
+		Velocity = Vector3.zero
+	end
+	local Alpha = 1 - math.exp(-VelocitySmoothing * Dt)
+	self.RootVel = self.RootVel:Lerp(Velocity, Alpha)
+
+	local RootCF = RealRoot.CFrame * self.RootOffset
+	Root.CFrame = RootCF
+
+	for _, Leg in self.Legs do
+		if Leg.Locked then
+			Leg.Part.CFrame = (Leg.Real :: BasePart).CFrame * Leg.Offset
+		end
+	end
+
+	local Torso = self.TemplateTorso
+	if Torso.Parent and not self.Resyncing then
+		local Err = RootCF:PointToWorldSpace(self.TorsoRest) - Torso.Position
+		if Err.Magnitude > FollowMaxError then
+			Err = Err.Unit * FollowMaxError
+		end
+		Torso.AssemblyLinearVelocity = self.RootVel + Err * FollowGain
+	end
+end
+
+function Puppet:SendAim()
+	local Now = os.clock()
+	if Now - self.LastAimSend < 1 / AimSendRate then
+		return
+	end
+	if math.abs(self.AimDelta - self.SentDelta) < 0.03 and math.abs(self.AimPitch - self.SentPitch) < 0.03 then
+		return
+	end
+
+	self.LastAimSend = Now
+	self.SentDelta = self.AimDelta
+	self.SentPitch = self.AimPitch
+	pcall(Networker.FireServer, EventAim, self.AimDelta, self.AimPitch)
+end
+
+function Puppet:UpdateAim(Dt: number)
+	if self.State == States.Dead or self.State == States.Airborne then
+		return
+	end
+
+	local Look = self.RootPart.CFrame.LookVector
+	local BodyFlat = Vector3.new(Look.X, 0, Look.Z)
+	if BodyFlat.Magnitude < 0.01 then
+		return
+	end
+	BodyFlat = BodyFlat.Unit
+
+	if self.IsLocal then
+		local Camera = workspace.CurrentCamera
+		if Camera then
+			local Mouse = UserInputService:GetMouseLocation()
+			local Direction = Camera:ViewportPointToRay(Mouse.X, Mouse.Y).Direction
+			local Flat = Vector3.new(Direction.X, 0, Direction.Z)
+			if Flat.Magnitude > 0.05 then
+				self.AimDelta = math.atan2(BodyFlat:Cross(Flat.Unit).Y, BodyFlat:Dot(Flat.Unit))
+			end
+			self.AimPitch = math.asin(math.clamp(Direction.Unit.Y, -1, 1))
+			self:SendAim()
+		end
+	else
+		local Yaw = self.Character:GetAttribute(AttrYaw)
+		local Pitch = self.Character:GetAttribute(AttrPitch)
+		if typeof(Yaw) == "number" then
+			self.AimDelta = Yaw
+		end
+		if typeof(Pitch) == "number" then
+			self.AimPitch = Pitch
+		end
+	end
+
+	local Delta = self.AimDelta
+	local Fade = math.clamp((math.pi - math.abs(Delta)) / AimBehindFade, 0, 1)
+	local TorsoYawTarget = math.clamp(Delta * TorsoFollow, -TorsoMaxYaw, TorsoMaxYaw) * Fade
+	local HeadYawTarget = math.clamp(Delta, -HeadMaxYaw, HeadMaxYaw) * Fade
+	local HeadPitchTarget = math.clamp(self.AimPitch, -AimMaxPitch, AimMaxPitch)
+
+	local Alpha = 1 - math.exp(-AimSmoothing * Dt)
+	self.TorsoYaw += (TorsoYawTarget - self.TorsoYaw) * Alpha
+	self.HeadYaw += (HeadYawTarget - self.HeadYaw) * Alpha
+	self.HeadPitch += (HeadPitchTarget - self.HeadPitch) * Alpha
+
+	if self.HeadAlign then
+		self.HeadAlign.CFrame = CFrame.Angles(0, self.HeadYaw, 0)
+			* CFrame.lookAt(Vector3.zero, BodyFlat)
+			* CFrame.Angles(self.HeadPitch, 0, 0)
+	end
+end
+
+function Puppet:GetLocalMove(): Vector3
+	local Move
+	if self.IsLocal then
+		Move = self.Humanoid.MoveDirection
+	else
+		local Velocity = self.RootVel
+		Move = Vector3.new(Velocity.X, 0, Velocity.Z) / math.max(self.Humanoid.WalkSpeed, 1)
+		if Move.Magnitude > 1 then
+			Move = Move.Unit
+		end
+	end
+	return self.RootPart.CFrame:VectorToObjectSpace(Move)
+end
+
+function Puppet:UpdateLean(Dt: number)
+	local Follow = self.TorsoFollow
+	if not Follow or not Follow.Parent or self.State == States.Dead then
+		return
+	end
+
+	local LocalMove = self:GetLocalMove()
+	local TargetPitch = LocalMove.Z * Config.LeanForward
+	local TargetRoll = -LocalMove.X * Config.LeanSide
+
+	local Alpha = 1 - math.exp(-Config.LeanSmoothing * Dt)
+	self.LeanPitch += (TargetPitch - self.LeanPitch) * Alpha
+	self.LeanRoll += (TargetRoll - self.LeanRoll) * Alpha
+
+	Follow.CFrame = CFrame.Angles(0, self.TorsoYaw, 0) * self.RestRot * CFrame.Angles(self.LeanPitch, 0, self.LeanRoll)
+end
+
+function Puppet:Step(Dt: number)
+	if self.Destroyed or self.State == States.Dead then
+		return
+	end
+	if self.Driven then
+		self:PollState()
+	end
+	self:Watchdog(Dt)
+	if self.Driven then
+		self:Drive(Dt)
+	end
+	self:UpdateAim(Dt)
+	self:UpdateLean(Dt)
+	self:UpdateResponsiveness(Dt)
+	self:UpdateCustomLockedLimbs()
+end
+
+function Puppet:Destroy(Restore: boolean?)
+	if self.Destroyed then
+		return
+	end
+	self.Destroyed = true
+	self.Token += 1
+
+	for _, Connection in self.connections do
+		Connection:Disconnect()
+	end
+	table.clear(self.connections)
+	table.clear(self.PartOffsets)
+
+	if Restore then
+		self:RestoreReal()
+	end
+
+	if Puppets[self.Character] == self then
+		Puppets[self.Character] = nil
+	end
+
+	if self.Template then
+		self.Template:Destroy()
+	end
+end
+
+local function Attach(Character: Instance)
+	if not Character:IsA("Model") then
+		return
+	end
+	if Puppets[Character] or Pending[Character] then
+		return
+	end
+	Pending[Character] = true
+
+	local TemplateName = Character:GetAttribute(AttrTemplate)
+	local StartTime = os.clock()
+	while typeof(TemplateName) ~= "string" and os.clock() - StartTime < 5 and Character:IsDescendantOf(workspace) do
+		task.wait(0.1)
+		TemplateName = Character:GetAttribute(AttrTemplate)
+	end
+
+	local NewPuppet = nil
+	if typeof(TemplateName) == "string" then
+		local Ok, Result = pcall(Puppet.new, Character, TemplateName)
+		if Ok then
+			NewPuppet = Result
+		else
+			warn("[Ragdoll] error for " .. Character.Name .. ": " .. tostring(Result))
+		end
+	else
+		warn("[Ragdoll] no template attribute on " .. Character.Name)
+	end
+	Pending[Character] = nil
+
+	if not NewPuppet then
+		return
+	end
+
+	if not CollectionService:HasTag(Character, Tag) or not Character:IsDescendantOf(workspace) then
+		NewPuppet:Destroy()
+		return
+	end
+
+	Puppets[Character] = NewPuppet
+	NewPuppet:PrepareReal()
+	NewPuppet:HideReal()
+
+	NewPuppet.connections.BombHighlight = Character:GetAttributeChangedSignal(AttrBomb):Connect(function()
+		NewPuppet:UpdateHighlight()
+	end)
+	NewPuppet:UpdateHighlight()
+
+	NewPuppet.connections.TemplateChanged = Character:GetAttributeChangedSignal(AttrTemplate):Connect(function()
+		local NewName = Character:GetAttribute(AttrTemplate)
+		if typeof(NewName) ~= "string" or NewName == NewPuppet.TemplateName then
+			return
+		end
+		NewPuppet:Destroy(true)
+		task.defer(Attach, Character)
+	end)
+end
+
+local function Detach(Character: Instance)
+	local Existing = Puppets[Character :: Model]
+	if Existing then
+		Existing:Destroy(true)
+	end
+end
+
+local RagdollClient = {}
+local Initialized = false
+
+function RagdollClient.Init()
+	if Initialized then
+		return
+	end
+	Initialized = true
+
+	CollectionService:GetInstanceAddedSignal(Tag):Connect(function(Instance_)
+		task.spawn(Attach, Instance_)
+	end)
+	CollectionService:GetInstanceRemovedSignal(Tag):Connect(Detach)
+	for _, Instance_ in CollectionService:GetTagged(Tag) do
+		task.spawn(Attach, Instance_)
+	end
+
+	local function WatchLocalCharacter(Character: Model)
+		Character:GetAttributeChangedSignal(AttrBomb):Connect(RefreshAllHighlights)
+		RefreshAllHighlights()
+	end
+
+	LocalPlayer.CharacterAdded:Connect(WatchLocalCharacter)
+	if LocalPlayer.Character then
+		WatchLocalCharacter(LocalPlayer.Character)
+	end
+
+	RunService.Heartbeat:Connect(function(Dt)
+		if Dt <= 0 then
+			return
+		end
+		for _, Existing in Puppets do
+			Existing:Step(Dt)
+		end
+	end)
+end
+
+function RagdollClient.Apply(Character: Model)
+	CollectionService:AddTag(Character, Tag)
+end
+
+function RagdollClient.Remove(Character: Model)
+	CollectionService:RemoveTag(Character, Tag)
+end
+
+function RagdollClient.ResyncCharacter(Character: Model)
+	local Existing = Puppets[Character]
+	if Existing then
+		Existing:Resync()
+	end
+end
+
+return RagdollClient
